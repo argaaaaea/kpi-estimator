@@ -53,6 +53,9 @@ def get_cli_token():
         capture_output=True, text=True
     )
     data = json.loads(result.stdout)
+    if "result" not in data:
+        msg = data.get("message") or data.get("name") or str(data)
+        raise RuntimeError(f"SF CLI error: {msg}. Run: sf login -o {SF_ALIAS}")
     return data["result"]["accessToken"], data["result"]["instanceUrl"]
 
 def resolve_identity():
@@ -76,6 +79,8 @@ def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if "user_id" not in session:
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "Not authenticated", "auth_required": True}), 401
             return redirect(url_for("login"))
         return f(*args, **kwargs)
     return decorated
@@ -449,18 +454,17 @@ def get_projects_by_time_entries(sf, user_id, qs, qe):
     if not proj_ids:
         return []
 
-    # Step 3: fetch those projects completed this quarter (no SE filter yet — do it in Python)
+    # Step 3: fetch completed projects from those IDs (no date filter — we filter by opp CloseDate in Step 5)
     results = []
     proj_list = list(proj_ids)
     for i in range(0, len(proj_list), 200):
         chunk = ",".join(f"'{p}'" for p in proj_list[i:i+200])
         recs = sf.query_all(f"""
             SELECT Id, Name, MPM4_BASE__Status__c, MPM4_BASE__Opportunity__c,
-                   MPM4_BASE__Opportunity__r.Name, Scoped_Hours_PSS__c
+                   MPM4_BASE__Opportunity__r.Name, Scoped_Hours_PSS__c, Date_Completed__c
             FROM MPM4_BASE__Milestone1_Project__c
             WHERE Id IN ({chunk})
             AND MPM4_BASE__Status__c = 'Completed'
-            AND Date_Completed__c >= {qs} AND Date_Completed__c <= {qe}
         """)["records"]
         results.extend(recs)
 
@@ -471,17 +475,27 @@ def get_projects_by_time_entries(sf, user_id, qs, qe):
     my_opp_ids = {o["Id"] for o in my_opps}
 
     # Step 5: only keep projects linked to Closed Won opps
+    # Quarter rule: opp closed in quarter OR project completed in quarter (whichever is later)
     linked_opp_ids = list({p["MPM4_BASE__Opportunity__c"] for p in results if p.get("MPM4_BASE__Opportunity__c")})
-    closed_won_ids = set()
+    closed_won_ids = set()       # opp closed this quarter
+    closed_won_any_ids = set()   # opp closed any time (for projects that completed this quarter)
     for i in range(0, len(linked_opp_ids), 200):
         chunk = ",".join(f"'{x}'" for x in linked_opp_ids[i:i+200])
-        rows = sf.query_all(f"SELECT Id FROM Opportunity WHERE Id IN ({chunk}) AND StageName = 'Closed Won'")["records"]
-        closed_won_ids.update(r["Id"] for r in rows)
+        rows = sf.query_all(f"SELECT Id, CloseDate FROM Opportunity WHERE Id IN ({chunk}) AND StageName = 'Closed Won'")["records"]
+        for r in rows:
+            closed_won_any_ids.add(r["Id"])
+            if r.get("CloseDate") and qs <= r["CloseDate"] <= qe:
+                closed_won_ids.add(r["Id"])
 
     return [
         p for p in results
         if p.get("MPM4_BASE__Opportunity__c") not in my_opp_ids
-        and (p.get("MPM4_BASE__Opportunity__c") in closed_won_ids or not p.get("MPM4_BASE__Opportunity__c"))
+        and (
+            p.get("MPM4_BASE__Opportunity__c") in closed_won_ids          # opp closed this quarter
+            or (p.get("MPM4_BASE__Opportunity__c") in closed_won_any_ids  # opp closed any time, project completed this quarter
+                and qs <= (p.get("Date_Completed__c") or "") <= qe)
+            or not p.get("MPM4_BASE__Opportunity__c")
+        )
     ]
 
 # ── KPI Calculation ───────────────────────────────────────────────────────────
@@ -562,16 +576,33 @@ def calculate_kpi(sf, user_id, year, quarter):
 
     # ── Delivery ──────────────────────────────────────────────────────────────
     # Primary: projects where I am the SE on the opp
-    my_projects = sf.query_all(f"""
+    # Projects where opp closed this quarter (project may have completed earlier)
+    my_projects_by_opp_close = sf.query_all(f"""
         SELECT Id, Name, MPM4_BASE__Status__c, MPM4_BASE__Opportunity__c,
                MPM4_BASE__Opportunity__r.Name, Scoped_Hours_PSS__c
         FROM MPM4_BASE__Milestone1_Project__c
         WHERE MPM4_BASE__Status__c = 'Completed'
         AND MPM4_BASE__Opportunity__c IN (
-            SELECT Id FROM Opportunity WHERE Sales_Engineer__c = '{user_id}' AND StageName = 'Closed Won'
+            SELECT Id FROM Opportunity WHERE Sales_Engineer__c = '{user_id}'
+            AND StageName = 'Closed Won'
+            AND CloseDate >= {qs} AND CloseDate <= {qe}
         )
-        AND Date_Completed__c >= {qs} AND Date_Completed__c <= {qe}
     """)["records"]
+    # Projects completed this quarter where opp is already Closed Won (opp may have closed earlier)
+    my_projects_by_proj_close = sf.query_all(f"""
+        SELECT Id, Name, MPM4_BASE__Status__c, MPM4_BASE__Opportunity__c,
+               MPM4_BASE__Opportunity__r.Name, Scoped_Hours_PSS__c
+        FROM MPM4_BASE__Milestone1_Project__c
+        WHERE MPM4_BASE__Status__c = 'Completed'
+        AND Date_Completed__c >= {qs} AND Date_Completed__c <= {qe}
+        AND MPM4_BASE__Opportunity__c IN (
+            SELECT Id FROM Opportunity WHERE Sales_Engineer__c = '{user_id}'
+            AND StageName = 'Closed Won'
+        )
+    """)["records"]
+    # Merge, deduplicate by project ID
+    seen_my_proj = {p["Id"] for p in my_projects_by_opp_close}
+    my_projects = my_projects_by_opp_close + [p for p in my_projects_by_proj_close if p["Id"] not in seen_my_proj]
 
     # Secondary: projects where I logged time but am not the SE (or no opp)
     assisted_projects = get_projects_by_time_entries(sf, user_id, qs, qe)
@@ -783,11 +814,45 @@ def calculate_kpi(sf, user_id, year, quarter):
                 "pts": pts,
             })
 
+    # ── Pipeline Acquisition ──────────────────────────────────────────────────
+    # Active opps (not Closed Won) where user is named SE — estimate acq pts if closed now
+    active_opps = sf.query_all(f"""
+        SELECT Id, Name, Account.Name, Type, Customer_Segment__c,
+               Board__c, Opportunity_Owner_Board__c, Deal_Type__c, StageName
+        FROM Opportunity
+        WHERE Sales_Engineer__c = '{user_id}'
+        AND StageName NOT IN ('Closed Won', 'Closed Lost')
+        ORDER BY LastModifiedDate DESC
+        LIMIT 30
+    """)["records"]
+
+    pipe_pf_map = get_product_family_map(sf, [o["Id"] for o in active_opps])
+    pipeline_acq = []
+    for o in active_opps:
+        seg   = o.get("Customer_Segment__c") or ""
+        otype = o.get("Type") or ""
+        board = o.get("Opportunity_Owner_Board__c") or o.get("Board__c") or ""
+        dt    = deal_type_for(o.get("Name", ""), o.get("Deal_Type__c"), pipe_pf_map.get(o["Id"]))
+        base  = acq_pts(seg, otype, board, dt)
+        if base > 0:
+            pipeline_acq.append({
+                "name":     o.get("Name", ""),
+                "account":  (o.get("Account") or {}).get("Name", ""),
+                "segment":  seg,
+                "type":     otype,
+                "board":    board,
+                "deal_type": dt,
+                "stage":    o.get("StageName", ""),
+                "pts":      round(base, 2),
+            })
+
     # ── Summary ───────────────────────────────────────────────────────────────
     acq_total = sum(r["pts"] for r in acquisition)
     del_total = sum(p["pts"] for opp in delivery_by_opp for p in opp["projects"])
     confirmed = min(acq_total + del_total, KPI_CAP)
-    pipeline_pts = sum(r["pts"] for r in pipeline)
+    pipeline_del_pts = sum(r["pts"] for r in pipeline)
+    pipeline_acq_pts = sum(r["pts"] for r in pipeline_acq)
+    pipeline_pts = pipeline_del_pts + pipeline_acq_pts
     projected = min(confirmed + pipeline_pts, KPI_CAP)
 
     return {
@@ -795,10 +860,13 @@ def calculate_kpi(sf, user_id, year, quarter):
         "acquisition": acquisition,
         "delivery": delivery_by_opp,
         "pipeline": pipeline,
+        "pipeline_acq": pipeline_acq,
         "summary": {
             "acq_pts": round(acq_total, 2),
             "del_pts": round(del_total, 2),
             "confirmed": round(confirmed, 2),
+            "pipeline_del_pts": round(pipeline_del_pts, 2),
+            "pipeline_acq_pts": round(pipeline_acq_pts, 2),
             "pipeline_pts": round(pipeline_pts, 2),
             "projected": round(projected, 2),
             "target": KPI_TARGET,
@@ -838,10 +906,13 @@ def logout():
 @app.route("/")
 @login_required
 def index():
-    return render_template_string(DASHBOARD_HTML,
+    resp = app.make_response(render_template_string(DASHBOARD_HTML,
         user_name=session.get("user_name", ""),
         user_id=session.get("user_id", "")
-    )
+    ))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 @app.route("/api/kpi")
 @login_required
@@ -1016,8 +1087,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   .section-card {
     background: var(--card); border-radius: 12px; border: 1px solid var(--border);
-    box-shadow: 0 1px 4px rgba(0,0,0,0.04); overflow: hidden;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.04);
   }
+  .section-card > table, .section-card > .section-header { overflow: hidden; }
   .section-header {
     padding: 16px 24px; border-bottom: 1px solid var(--border);
     display: flex; justify-content: space-between; align-items: center;
@@ -1158,9 +1230,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     <div class="section-card" id="pipeline-section">
       <div class="section-header">
-        <h2>Pipeline <span style="color:var(--muted);font-weight:400;font-size:0.85rem">Active projects — estimated if completed now</span></h2>
+        <h2>Pipeline <span style="color:var(--muted);font-weight:400;font-size:0.85rem">Estimated if closed/completed now</span></h2>
         <span class="total-badge" id="pipe-total-badge">0 pts</span>
       </div>
+      <p style="font-size:0.8rem;color:var(--muted);margin:0 0 8px 0">Delivery <span id="pipe-del-badge" style="font-weight:600;color:var(--text)">0 pts</span></p>
       <table>
         <thead><tr>
           <th>Project</th><th>Status</th><th style="text-align:right">Scoped</th>
@@ -1168,6 +1241,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <th style="text-align:right">Est. Points</th>
         </tr></thead>
         <tbody id="pipe-body"></tbody>
+      </table>
+      <p style="font-size:0.8rem;color:var(--muted);margin:16px 0 8px 0">Acquisition <span id="pipe-acq-badge" style="font-weight:600;color:var(--text)">0 pts</span></p>
+      <table>
+        <thead><tr>
+          <th>Opportunity</th><th>Segment</th><th>Type</th><th>Deal</th><th>Stage</th>
+          <th style="text-align:right">Est. Points</th>
+        </tr></thead>
+        <tbody id="pipe-acq-body"></tbody>
       </table>
     </div>
 
@@ -1211,10 +1292,11 @@ function calculate() {
 
   fetch(`/api/kpi?year=${y}&quarter=${q}`)
     .then(r => {
-      if (r.status === 401) return r.json().then(d => { throw new Error('session_expired'); });
+      if (r.status === 401) { window.location.href = '/login'; return; }
       return r.json();
     })
     .then(data => {
+      if (!data) return;
       document.getElementById('spinner').style.display = 'none';
       document.getElementById('calc-btn').disabled = false;
       if (data.error) { showError(data.error); return; }
@@ -1455,6 +1537,9 @@ function renderDashboard(data, isCurrent) {
   document.getElementById('pipeline-section').style.display = isCurrent ? '' : 'none';
   if (isCurrent) {
     document.getElementById('pipe-total-badge').textContent = fmt(s.pipeline_pts) + ' pts';
+    document.getElementById('pipe-del-badge').textContent = fmt(s.pipeline_del_pts) + ' pts';
+    document.getElementById('pipe-acq-badge').textContent = fmt(s.pipeline_acq_pts) + ' pts';
+
     const pipeBody = document.getElementById('pipe-body');
     if (!data.pipeline.length) {
       pipeBody.innerHTML = '<tr><td colspan="6" class="no-data">No active projects with logged hours</td></tr>';
@@ -1466,6 +1551,22 @@ function renderDashboard(data, isCurrent) {
           <td style="text-align:right">${fmt(r.scoped_hours)}h</td>
           <td style="text-align:right">${fmt(r.my_hours)}h</td>
           <td style="text-align:right;color:${r.other_hours>0?'var(--yellow)':'var(--muted)'}">${r.other_hours>0 ? fmt(r.other_hours)+'h' : '-'}</td>
+          <td style="text-align:right" class="pts-cell">${fmt(r.pts)}</td>
+        </tr>
+      `).join('');
+    }
+
+    const pipeAcqBody = document.getElementById('pipe-acq-body');
+    if (!data.pipeline_acq.length) {
+      pipeAcqBody.innerHTML = '<tr><td colspan="6" class="no-data">No active opportunities</td></tr>';
+    } else {
+      pipeAcqBody.innerHTML = data.pipeline_acq.map(r => `
+        <tr>
+          <td style="max-width:220px">${r.name}</td>
+          <td>${badge(r.segment)}</td>
+          <td><span class="badge badge-info">${r.type || '?'}</span></td>
+          <td><span class="badge ${r.deal_type==='SaaS'?'badge-Ar':'badge-B'}">${r.deal_type}</span></td>
+          <td style="font-size:0.78rem;color:var(--muted)">${r.stage}</td>
           <td style="text-align:right" class="pts-cell">${fmt(r.pts)}</td>
         </tr>
       `).join('');
