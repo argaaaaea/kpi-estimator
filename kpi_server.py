@@ -215,7 +215,7 @@ def get_services_sales_hours_bulk(sf, opp_ids, user_id):
             SELECT Id, MPM4_BASE__Project_Lookup__c
             FROM MPM4_BASE__Milestone1_Task__c
             WHERE MPM4_BASE__Project_Lookup__c IN ({chunk})
-            AND MPM4_BASE__Project_Milestone__r.Name LIKE '%Service Sales%'
+            AND MPM4_BASE__Project_Milestone__r.Name LIKE '%Service%Sales%'
         """)["records"]:
             task_proj_map[t["Id"]] = t["MPM4_BASE__Project_Lookup__c"]
 
@@ -275,7 +275,7 @@ def get_additional_acq_opps(sf, user_id, qs, qe):
             t["Id"] for t in sf.query_all(f"""
                 SELECT Id FROM MPM4_BASE__Milestone1_Task__c
                 WHERE Id IN ({chunk})
-                AND MPM4_BASE__Project_Milestone__r.Name LIKE '%Service Sales%'
+                AND MPM4_BASE__Project_Milestone__r.Name LIKE '%Service%Sales%'
             """)["records"]
         )
     if not ss_task_ids:
@@ -586,6 +586,11 @@ def calculate_kpi(sf, user_id, year, quarter):
             my_pct = my_hrs / total_hrs
             pts = round(base * my_pct, 2)
 
+        has_ps = (
+            "professional services" in proj_name.lower() or
+            "professional services" in opp_name.lower()
+        )
+
         proj_data = {
             "name": proj_name,
             "status": p.get("MPM4_BASE__Status__c", ""),
@@ -595,9 +600,11 @@ def calculate_kpi(sf, user_id, year, quarter):
             "other_hours": round(other_hrs, 2),
             "other_names": other_names,
             "my_pct": round(my_pct * 100, 0),
+            "my_pct_raw": round(my_pct, 6),
             "pts": pts,
             "no_hours": total_hrs == 0,
             "assisted": p["Id"] not in seen_proj_ids,
+            "has_ps": has_ps,
         }
 
         group_key = opp_id or p["Id"]  # group no-opp projects individually
@@ -986,6 +993,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .badge-D    { background: #f1f5f9; color: var(--muted); }
   .badge-info { background: #f0f9ff; color: #0369a1; }
   .shared-tag { display: inline-block; font-size: 0.7rem; color: var(--yellow); background: #fefce8; border: 1px solid #fde68a; border-radius: 4px; padding: 1px 6px; margin-left: 6px; }
+  .accel-btn {
+    padding: 2px 7px; font-size: 0.7rem; font-weight: 700; border-radius: 4px; cursor: pointer;
+    background: #f1f5f9; border: 1px solid #e2e8f0; color: var(--muted);
+    transition: background 0.15s, color 0.15s;
+  }
+  .accel-btn.active { background: #fef9c3; border-color: #f59e0b; color: #92400e; }
   .multi-proj-tag { display: inline-block; font-size: 0.7rem; color: var(--accent); background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 4px; padding: 1px 6px; margin-left: 6px; }
   .pts-cell { font-weight: 700; color: var(--primary); font-size: 0.95rem; }
   .pts-cell.shared { color: var(--yellow); }
@@ -1064,7 +1077,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <th>Opportunity</th><th>Account</th><th>Segment</th>
           <th>Type</th><th>Board</th><th>Deal</th>
           <th style="text-align:right">My SS Hrs</th><th style="text-align:right">Other SS</th><th style="text-align:right">My %</th>
-          <th style="text-align:right">Points</th><th>Notes</th>
+          <th style="text-align:right">Points</th><th style="text-align:center">Accel.</th><th>Notes</th>
         </tr></thead>
         <tbody id="acq-body"></tbody>
       </table>
@@ -1079,13 +1092,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <thead><tr>
           <th>Opportunity / Project</th><th style="text-align:right">Scoped</th>
           <th style="text-align:right">My Hrs</th><th style="text-align:right">Other Hrs</th>
-          <th style="text-align:right">My %</th><th style="text-align:right">Points</th><th>Notes</th>
+          <th style="text-align:right">My %</th><th style="text-align:right">Points</th>
+          <th>PS Type</th><th>Notes</th>
         </tr></thead>
         <tbody id="del-body"></tbody>
       </table>
     </div>
 
-    <div class="section-card">
+    <div class="section-card" id="pipeline-section">
       <div class="section-header">
         <h2>Pipeline <span style="color:var(--muted);font-weight:400;font-size:0.85rem">Active projects — estimated if completed now</span></h2>
         <span class="total-badge" id="pipe-total-badge">0 pts</span>
@@ -1147,7 +1161,8 @@ function calculate() {
       document.getElementById('spinner').style.display = 'none';
       document.getElementById('calc-btn').disabled = false;
       if (data.error) { showError(data.error); return; }
-      renderDashboard(data);
+      const isCurrent = parseInt(q) === curQ && parseInt(y) === curY;
+      renderDashboard(data, isCurrent);
     })
     .catch(e => {
       document.getElementById('spinner').style.display = 'none';
@@ -1166,33 +1181,111 @@ function showError(msg) {
   el.style.display = 'block';
 }
 
-function renderDashboard(data) {
+const PS_PTS = {"2":2,"2t":2,"5":5,"7.5":7.5,"10s":10,"10g":10,"15":15,"5d":5,"10d":10,"15u":15};
+const PS_ADDITIVE = new Set(["2","2t"]); // Tune-Up and Training add CPaaS base (2pts)
+const CPAAS_BASE_PTS = 2;
+
+function onPsSelect(sel) {
+  const row = sel.closest('tr');
+  const ptsCell = row.querySelector('.proj-pts-cell');
+  const basePts = parseFloat(sel.dataset.basePts);
+  const myPct = parseFloat(sel.dataset.myPct);
+  if (!sel.value) {
+    ptsCell.textContent = fmt(basePts);
+  } else {
+    const psPts = PS_PTS[sel.value] || 0;
+    const fullPts = PS_ADDITIVE.has(sel.value) ? CPAAS_BASE_PTS + psPts : psPts;
+    const newPts = Math.round(fullPts * myPct * 100) / 100;
+    ptsCell.textContent = fmt(newPts);
+  }
+  updateDelTotal();
+}
+
+function updateDelTotal() {
+  const s = window._kpiSummary;
+  if (!s) return;
+  let delTotal = 0;
+  document.querySelectorAll('.proj-pts-cell').forEach(cell => {
+    delTotal += parseFloat(cell.textContent) || 0;
+  });
+  delTotal = Math.round(delTotal * 100) / 100;
+  const acqTotal = parseFloat(document.getElementById('acq-pts-value').textContent) || s.acq_pts;
+  const confirmed = Math.min(acqTotal + delTotal, s.cap);
+  const color = confirmed >= s.target ? 'green' : confirmed >= s.target * 0.75 ? 'yellow' : 'red';
+  document.getElementById('del-total-badge').textContent = fmt(delTotal) + ' pts';
+  document.getElementById('del-pts-value').textContent = fmt(delTotal);
+  document.getElementById('confirmed-value').textContent = fmt(confirmed);
+  document.getElementById('confirmed-sub').textContent = `of ${s.target} target (${Math.round(confirmed/s.target*100)}%)`;
+  document.getElementById('confirmed-card').className = `stat-card ${color}`;
+}
+
+function toggleAccel(btn) {
+  const row = btn.closest('tr');
+  const basePts = parseFloat(row.dataset.basePts);
+  const isOn = btn.classList.contains('active');
+  const ptsCell = row.querySelector('.pts-cell');
+  if (isOn) {
+    btn.classList.remove('active');
+    btn.title = 'Apply 1.5x Named Account accelerator';
+    ptsCell.textContent = fmt(basePts);
+  } else {
+    btn.classList.add('active');
+    btn.title = 'Remove 1.5x accelerator';
+    ptsCell.textContent = fmt(Math.round(basePts * 1.5 * 100) / 100);
+  }
+  updateAcqTotal();
+}
+
+function updateAcqTotal() {
+  const s = window._kpiSummary;
+  if (!s) return;
+  let acqTotal = 0;
+  document.querySelectorAll('#acq-body tr[data-base-pts]').forEach(row => {
+    const basePts = parseFloat(row.dataset.basePts);
+    const isAccel = row.querySelector('.accel-btn.active') !== null;
+    acqTotal += isAccel ? Math.round(basePts * 1.5 * 100) / 100 : basePts;
+  });
+  acqTotal = Math.round(acqTotal * 100) / 100;
+  const delTotal = parseFloat(document.getElementById('del-pts-value').textContent) || s.del_pts;
+  const confirmed = Math.min(acqTotal + delTotal, s.cap);
+  const projected = Math.min(confirmed + s.pipeline_pts, s.cap);
+  const color = confirmed >= s.target ? 'green' : confirmed >= s.target * 0.75 ? 'yellow' : 'red';
+  document.getElementById('acq-total-badge').textContent = fmt(acqTotal) + ' pts';
+  document.getElementById('acq-pts-value').textContent = fmt(acqTotal);
+  document.getElementById('confirmed-value').textContent = fmt(confirmed);
+  document.getElementById('confirmed-sub').textContent = `of ${s.target} target (${Math.round(confirmed/s.target*100)}%)`;
+  document.getElementById('confirmed-card').className = `stat-card ${color}`;
+}
+
+function renderDashboard(data, isCurrent) {
+  window._kpiSummary = data.summary;
   const s = data.summary;
   const pct = Math.min((s.confirmed / s.target) * 100, 100);
   const projPct = Math.min((s.projected / s.target) * 100, 100);
   const color = s.confirmed >= s.target ? 'green' : s.confirmed >= s.target * 0.75 ? 'yellow' : 'red';
 
   document.getElementById('stat-cards').innerHTML = `
-    <div class="stat-card ${color}">
+    <div class="stat-card ${color}" id="confirmed-card">
       <div class="label">Confirmed Total</div>
-      <div class="value">${fmt(s.confirmed)}</div>
-      <div class="sub">of ${s.target} target (${Math.round(s.confirmed/s.target*100)}%)</div>
+      <div class="value" id="confirmed-value">${fmt(s.confirmed)}</div>
+      <div class="sub" id="confirmed-sub">of ${s.target} target (${Math.round(s.confirmed/s.target*100)}%)</div>
     </div>
     <div class="stat-card">
       <div class="label">Acquisition</div>
-      <div class="value" style="color:var(--primary)">${fmt(s.acq_pts)}</div>
+      <div class="value" id="acq-pts-value" style="color:var(--primary)">${fmt(s.acq_pts)}</div>
       <div class="sub">pts from closed won</div>
     </div>
     <div class="stat-card">
       <div class="label">Delivery</div>
-      <div class="value" style="color:var(--primary)">${fmt(s.del_pts)}</div>
+      <div class="value" id="del-pts-value" style="color:var(--primary)">${fmt(s.del_pts)}</div>
       <div class="sub">pts from completed projects</div>
     </div>
+    ${isCurrent ? `
     <div class="stat-card" style="border-color:#bae6fd">
       <div class="label">Projected (+ pipeline)</div>
       <div class="value" style="color:var(--accent)">${fmt(s.projected)}</div>
       <div class="sub">if all active projects close</div>
-    </div>
+    </div>` : ''}
   `;
 
   document.getElementById('progress-card').innerHTML = `
@@ -1200,7 +1293,7 @@ function renderDashboard(data) {
     <div class="progress-bar-wrap" style="margin-bottom:6px">
       <div class="progress-bar ${color}" style="width:${pct}%"></div>
     </div>
-    ${s.projected > s.confirmed ? `
+    ${isCurrent && s.projected > s.confirmed ? `
     <div class="progress-bar-wrap">
       <div class="progress-bar projected" style="width:${projPct}%"></div>
     </div>` : ''}
@@ -1208,14 +1301,14 @@ function renderDashboard(data) {
       <span>0</span><span>${s.target} (target)</span><span>${s.cap} (CAP)</span>
     </div>
     ${s.confirmed < s.target
-      ? `<p style="margin-top:10px;font-size:0.85rem;color:var(--muted)">Need <strong>${fmt(s.target - s.confirmed)}</strong> more pts to hit target. Projected <strong>${fmt(s.projected)}</strong> if pipeline closes.</p>`
+      ? `<p style="margin-top:10px;font-size:0.85rem;color:var(--muted)">Need <strong>${fmt(s.target - s.confirmed)}</strong> more pts to hit target.${isCurrent ? ` Projected <strong>${fmt(s.projected)}</strong> if pipeline closes.` : ''}</p>`
       : `<p style="margin-top:10px;font-size:0.85rem;color:var(--green)"><strong>Target reached!</strong> Confirmed ${fmt(s.confirmed)} pts.</p>`}
   `;
 
   document.getElementById('acq-total-badge').textContent = fmt(s.acq_pts) + ' pts';
   const acqBody = document.getElementById('acq-body');
   if (!data.acquisition.length) {
-    acqBody.innerHTML = '<tr><td colspan="11" class="no-data">No closed won opportunities this quarter</td></tr>';
+    acqBody.innerHTML = '<tr><td colspan="12" class="no-data">No closed won opportunities this quarter</td></tr>';
   } else {
     acqBody.innerHTML = data.acquisition.map(r => {
       const assistedTag = r.assisted ? `<span class="multi-proj-tag">Assisted</span>` : '';
@@ -1223,7 +1316,7 @@ function renderDashboard(data) {
         ? `<span style="color:var(--yellow)">${fmt(r.other_ss_hrs)}h (${r.other_ss_names.join(', ')})</span>`
         : `<span style="color:var(--muted)">-</span>`;
       const pctStr = r.other_ss_hrs > 0 ? `${r.my_ss_pct}%` : (r.my_ss_hrs > 0 ? '100%' : '-');
-      return `<tr>
+      return `<tr data-base-pts="${r.pts}">
         <td style="max-width:220px">${r.name}${assistedTag}</td>
         <td style="color:var(--muted)">${r.account}</td>
         <td>${badge(r.segment)}</td>
@@ -1234,6 +1327,7 @@ function renderDashboard(data) {
         <td style="text-align:right">${ssOther}</td>
         <td style="text-align:right">${pctStr}</td>
         <td style="text-align:right" class="pts-cell ${r.other_ss_hrs > 0 ? 'shared' : ''}">${fmt(r.pts)}</td>
+        <td style="text-align:center"><button class="accel-btn" onclick="toggleAccel(this)" title="Apply 1.5x Named Account accelerator">1.5x</button></td>
         <td style="font-size:0.78rem;color:var(--muted)">${r.notes}</td>
       </tr>`;
     }).join('');
@@ -1242,25 +1336,40 @@ function renderDashboard(data) {
   document.getElementById('del-total-badge').textContent = fmt(s.del_pts) + ' pts';
   const delBody = document.getElementById('del-body');
   if (!data.delivery.length) {
-    delBody.innerHTML = '<tr><td colspan="7" class="no-data">No completed projects this quarter</td></tr>';
+    delBody.innerHTML = '<tr><td colspan="8" class="no-data">No completed projects this quarter</td></tr>';
   } else {
     let html = '';
     data.delivery.forEach(opp => {
       const multiTag = opp.project_count > 1 ? `<span class="multi-proj-tag">${opp.project_count} projects</span>` : '';
-      html += `<tr class="opp-row"><td colspan="7">${opp.opp_name}${multiTag}</td></tr>`;
+      html += `<tr class="opp-row"><td colspan="8">${opp.opp_name}${multiTag}</td></tr>`;
       opp.projects.forEach(p => {
         const sharedTag = p.other_hours > 0 ? `<span class="shared-tag">Shared</span>` : '';
         const assistedTag = p.assisted ? `<span class="multi-proj-tag">Assisted</span>` : '';
         const retainerTag = p.is_retainer ? `<span class="multi-proj-tag" style="color:#7c3aed;background:#ede9fe;border-color:#ddd6fe">Retainer</span>` : '';
         const pctStr = p.other_hours > 0 ? `${p.my_pct}%` : '100%';
         const othersStr = p.other_hours > 0 ? `${fmt(p.other_hours)}h (${p.other_names.join(', ')})` : '-';
+        const psDropdown = p.has_ps ? `
+          <select class="ps-select" data-base-pts="${p.pts}" data-my-pct="${p.my_pct_raw}" onchange="onPsSelect(this)" style="font-size:0.75rem;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:white;color:var(--text);max-width:160px">
+            <option value="">Auto</option>
+            <option value="2">Tune-Up (CPaaS + 8h · 4pts)</option>
+            <option value="2t">Training (CPaaS + 14h · 4pts)</option>
+            <option value="5">Guided Launch (16h · 5pts)</option>
+            <option value="7.5">Email Premium Launch (24h · 7.5pts)</option>
+            <option value="10s">Configured Start (35h · 10pts)</option>
+            <option value="10g">Configured Grow (65h · 10pts)</option>
+            <option value="15">Configured Scale (85h · 15pts)</option>
+            <option value="5d">CX Discovery (20h · 5pts)</option>
+            <option value="10d">CX Design (40h · 10pts)</option>
+            <option value="15u">CX Uplift (80h · 15pts)</option>
+          </select>` : '';
         html += `<tr class="proj-row">
           <td>${p.name}${sharedTag}${assistedTag}${retainerTag}</td>
           <td style="text-align:right">${fmt(p.scoped_hours)}h</td>
           <td style="text-align:right">${fmt(p.my_hours)}h</td>
           <td style="text-align:right;color:${p.other_hours>0?'var(--yellow)':'var(--muted)'}">${othersStr}</td>
           <td style="text-align:right">${pctStr}</td>
-          <td style="text-align:right" class="pts-cell ${p.other_hours>0?'shared':''}">${fmt(p.pts)}</td>
+          <td style="text-align:right" class="pts-cell proj-pts-cell ${p.other_hours>0?'shared':''}">${fmt(p.pts)}</td>
+          <td>${psDropdown}</td>
           <td style="font-size:0.78rem;color:var(--muted)">${p.scoped_label}</td>
         </tr>`;
       });
@@ -1268,21 +1377,24 @@ function renderDashboard(data) {
     delBody.innerHTML = html;
   }
 
-  document.getElementById('pipe-total-badge').textContent = fmt(s.pipeline_pts) + ' pts';
-  const pipeBody = document.getElementById('pipe-body');
-  if (!data.pipeline.length) {
-    pipeBody.innerHTML = '<tr><td colspan="6" class="no-data">No active projects with logged hours</td></tr>';
-  } else {
-    pipeBody.innerHTML = data.pipeline.map(r => `
-      <tr>
-        <td>${r.name}</td>
-        <td><span class="badge badge-info">${r.status}</span></td>
-        <td style="text-align:right">${fmt(r.scoped_hours)}h</td>
-        <td style="text-align:right">${fmt(r.my_hours)}h</td>
-        <td style="text-align:right;color:${r.other_hours>0?'var(--yellow)':'var(--muted)'}">${r.other_hours>0 ? fmt(r.other_hours)+'h' : '-'}</td>
-        <td style="text-align:right" class="pts-cell">${fmt(r.pts)}</td>
-      </tr>
-    `).join('');
+  document.getElementById('pipeline-section').style.display = isCurrent ? '' : 'none';
+  if (isCurrent) {
+    document.getElementById('pipe-total-badge').textContent = fmt(s.pipeline_pts) + ' pts';
+    const pipeBody = document.getElementById('pipe-body');
+    if (!data.pipeline.length) {
+      pipeBody.innerHTML = '<tr><td colspan="6" class="no-data">No active projects with logged hours</td></tr>';
+    } else {
+      pipeBody.innerHTML = data.pipeline.map(r => `
+        <tr>
+          <td>${r.name}</td>
+          <td><span class="badge badge-info">${r.status}</span></td>
+          <td style="text-align:right">${fmt(r.scoped_hours)}h</td>
+          <td style="text-align:right">${fmt(r.my_hours)}h</td>
+          <td style="text-align:right;color:${r.other_hours>0?'var(--yellow)':'var(--muted)'}">${r.other_hours>0 ? fmt(r.other_hours)+'h' : '-'}</td>
+          <td style="text-align:right" class="pts-cell">${fmt(r.pts)}</td>
+        </tr>
+      `).join('');
+    }
   }
 
   document.getElementById('dashboard').style.display = 'block';

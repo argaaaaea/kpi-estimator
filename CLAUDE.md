@@ -135,6 +135,29 @@ Awarded when a project reaches `Completed` status and the linked Opportunity is 
 
 **Scoped hours source**: `Scoped_Hours_PSS__c` on the project. If null: SaaS fallback = 4h, CPaaS fallback = 2h.
 
+**PS Type dropdown (manual override)**: For projects where the opportunity or project name contains "Professional Services", the dashboard shows a **PS Type** dropdown on the delivery row. The SE should select the correct PS package to get an accurate point estimate — the auto fallback is often imprecise.
+
+Scoring rules for each PS type:
+
+| PS Type | Logic | Result |
+|---|---|---|
+| Tune-Up (8h) | CPaaS base (2pts) + PS (2pts) | **4 pts** |
+| Training (14h) | CPaaS base (2pts) + PS (2pts) | **4 pts** |
+| Guided Launch (16h) | PS only | **5 pts** |
+| Email Premium Launch (24h) | PS only | **7.5 pts** |
+| Configured Start (35h) | PS only | **10 pts** |
+| Configured Grow (65h) | PS only | **10 pts** |
+| Configured Scale (85h) | PS only | **15 pts** |
+| CX Discovery (20h) | PS only | **5 pts** |
+| CX Design (40h) | PS only | **10 pts** |
+| CX Uplift (80h) | PS only | **15 pts** |
+
+Tune-Up and Training are **additive** (CPaaS component is always included) because the official KPI rule states CPaaS + Training is calculated separately, not as combined sold hours. All other PS packages use only the PS package points.
+
+Points are always proportionally split by logged hours: `pts = full_pts × (my_hrs / total_hrs)`.
+
+> **Note for users**: The dashboard cannot automatically detect the PS package type from Salesforce. Always set the PS Type dropdown on any "Professional Services" project to get a correct delivery point estimate.
+
 **Shared delivery**:
 ```
 user_pts = base_pts × (my_logged_hours / total_logged_hours)
@@ -156,6 +179,12 @@ Retainer projects (project name contains `[Retainer]`):
 - **75% rule**: if total tracked hours in quarter ≥ 75% of quarterly hours → use full quarterly hours for bracket; otherwise use actual tracked hours
 - Points split proportionally: `user_pts = base_pts × (my_hrs_in_quarter / total_hrs_in_quarter)`
 - Time entries are filtered to the quarter (not all-time) for retainer projects
+
+### Named Account Accelerator
+
+For Named Accounts, total acquired points are multiplied by **1.5**. This is the only accelerator rate.
+
+Named accounts are maintained by Customer Operations and updated twice a year. There is no Salesforce field that reliably identifies named accounts programmatically — the dashboard provides a manual **1.5x button** on each acquisition row so the SE can apply the accelerator per opp as needed.
 
 Target: **71 pts/quarter**. CAP: **130 pts**.
 
@@ -306,4 +335,4 @@ GET /api/kpi?year=2026&quarter=1
 
 **DC to DC points not showing**: Project name must contain `[DC to DC SaaS]` or `[DC to DC CPaaS]` (with square brackets, case-insensitive).
 
-**Service Sales & Planning hours not found**: The milestone name in SF must contain "Service Sales". The SOQL filter is `MPM4_BASE__Project_Milestone__r.Name LIKE '%Service Sales%'`.
+**Service Sales & Planning hours not found**: The milestone name in SF is "Services Sales & Planning". The SOQL filter is `MPM4_BASE__Project_Milestone__r.Name LIKE '%Service%Sales%'` (using `%Service%Sales%` to match both "Service Sales" and "Services Sales" variants).
