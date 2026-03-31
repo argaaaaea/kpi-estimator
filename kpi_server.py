@@ -1343,6 +1343,8 @@ function onPsSelect(sel) {
 
   if (!sel.value) {
     ptsCell.textContent = fmt(basePts);
+  } else if (sel.value === 'zero') {
+    ptsCell.textContent = fmt(0);
   } else if (sel.value === 'nops_cpaas' || sel.value === 'nops_saas') {
     const fallback = sel.value === 'nops_saas' ? 4.0 : 2.0;
     const hrs = scopedRaw !== '' ? parseFloat(scopedRaw) : fallback;
@@ -1506,6 +1508,7 @@ function renderDashboard(data, isCurrent) {
         const psDropdown = `
           <select class="ps-select" data-base-pts="${p.pts}" data-my-pct="${p.my_pct_raw}" data-scoped-raw="${p.scoped_hours_raw ?? ''}" onchange="onPsSelect(this)" style="font-size:0.75rem;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:white;color:var(--text);max-width:175px">
             <option value="">Auto</option>
+            <option value="zero">Exclude (0 pts)</option>
             <option value="nops_cpaas">No PS (CPaaS)</option>
             <option value="nops_saas">No PS (SaaS)</option>
             <option value="2">Tune-Up (CPaaS + 8h · 4pts)</option>
