@@ -115,13 +115,13 @@ Deal type rule: if opportunity name contains "Professional Services" → treat a
 user_pts = base_pts × (my_ss_hours / total_ss_hours)
 ```
 
-If no Service Sales & Planning hours are found at all, full points go to the named SE.
+**Acquisition points are only awarded if the SE has logged SS&P hours on the opportunity.** If the SE has zero SS&P hours, no acquisition points are given — even if they are the named `Sales_Engineer__c`. (Previous rule that gave named SE full points without SS&P hours has been removed.)
 
 All SEs who logged SS&P time on an opportunity appear in the acquisition table, even if they are not the named `Sales_Engineer__c` on the opportunity (called "Assisted").
 
 ### Delivery Points
 
-Awarded when a project reaches `Completed` status and the linked Opportunity is `Closed Won`. Points are based on scoped hours:
+Awarded when a project reaches `Completed` status, the linked Opportunity is `Closed Won`, **and the SE has logged at least some hours on the project**. Points are based on scoped hours:
 
 | Scoped Hours    | Points |
 |-----------------|--------|

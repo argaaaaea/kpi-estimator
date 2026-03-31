@@ -122,10 +122,39 @@ def is_retainer(proj_name):
 def is_ps(name):
     return "professional services" in name.lower()
 
-def deal_type_for(opp_name, deal_type_raw):
-    if is_ps(opp_name) or "saas" in (deal_type_raw or "").lower():
+def deal_type_for(opp_name, deal_type_raw, product_family=None):
+    if is_ps(opp_name):
+        return "SaaS"
+    # Product family (from OpportunityLineItem) always wins — SF Deal_Type__c is often stale
+    if product_family and "saas" in product_family.lower():
+        return "SaaS"
+    if "saas" in (deal_type_raw or "").lower():
         return "SaaS"
     return "CPaaS"
+
+
+def get_product_family_map(sf, opp_ids):
+    """For opps with null Deal_Type__c, fetch OpportunityLineItem product families.
+    Returns {opp_id: 'SaaS'|'CPaaS'} only for opps where a product family is found."""
+    if not opp_ids:
+        return {}
+    result = {}
+    for i in range(0, len(opp_ids), 200):
+        chunk = ",".join(f"'{x}'" for x in opp_ids[i:i+200])
+        rows = sf.query_all(
+            f"SELECT OpportunityId, PricebookEntry.Product2.Family "
+            f"FROM OpportunityLineItem "
+            f"WHERE OpportunityId IN ({chunk}) "
+            f"AND PricebookEntry.Product2.Family != null"
+        )["records"]
+        for r in rows:
+            oid = r["OpportunityId"]
+            family = (r.get("PricebookEntry") or {}).get("Product2", {}).get("Family") or ""
+            if oid not in result:
+                result[oid] = family
+            elif "saas" in family.lower():
+                result[oid] = family  # SaaS wins
+    return result
 
 def acq_pts(segment, opp_type, board, deal_type):
     base = SEGMENT_POINTS.get(segment, 0)
@@ -436,15 +465,23 @@ def get_projects_by_time_entries(sf, user_id, qs, qe):
         results.extend(recs)
 
     # Step 4: get the opp IDs where I am the SE, then exclude in Python
-    my_opp_ids = set()
     my_opps = sf.query_all(f"""
         SELECT Id FROM Opportunity WHERE Sales_Engineer__c = '{user_id}'
     """)["records"]
     my_opp_ids = {o["Id"] for o in my_opps}
 
+    # Step 5: only keep projects linked to Closed Won opps
+    linked_opp_ids = list({p["MPM4_BASE__Opportunity__c"] for p in results if p.get("MPM4_BASE__Opportunity__c")})
+    closed_won_ids = set()
+    for i in range(0, len(linked_opp_ids), 200):
+        chunk = ",".join(f"'{x}'" for x in linked_opp_ids[i:i+200])
+        rows = sf.query_all(f"SELECT Id FROM Opportunity WHERE Id IN ({chunk}) AND StageName = 'Closed Won'")["records"]
+        closed_won_ids.update(r["Id"] for r in rows)
+
     return [
         p for p in results
         if p.get("MPM4_BASE__Opportunity__c") not in my_opp_ids
+        and (p.get("MPM4_BASE__Opportunity__c") in closed_won_ids or not p.get("MPM4_BASE__Opportunity__c"))
     ]
 
 # ── KPI Calculation ───────────────────────────────────────────────────────────
@@ -472,18 +509,24 @@ def calculate_kpi(sf, user_id, year, quarter):
     # Batch-fetch Service Sales & Planning hours for all opps at once
     ss_hours = get_services_sales_hours_bulk(sf, [o["Id"] for o in all_opps], user_id)
 
+    # Fetch product family for all opps — SaaS product family always overrides Deal_Type__c
+    pf_map = get_product_family_map(sf, [o["Id"] for o in all_opps])
+
     acquisition = []
     for o in all_opps:
         seg   = o.get("Customer_Segment__c") or ""
         otype = o.get("Type") or ""
         board = o.get("Opportunity_Owner_Board__c") or o.get("Board__c") or ""
-        dt    = deal_type_for(o.get("Name", ""), o.get("Deal_Type__c"))
+        dt    = deal_type_for(o.get("Name", ""), o.get("Deal_Type__c"), pf_map.get(o["Id"]))
         base  = acq_pts(seg, otype, board, dt)
 
         my_ss, other_ss, other_ss_names = ss_hours.get(o["Id"], (0.0, 0.0, []))
         total_ss = my_ss + other_ss
 
-        if total_ss > 0:
+        if my_ss == 0:
+            my_pct = 0.0
+            pts    = 0.0
+        elif total_ss > 0:
             my_pct = my_ss / total_ss
             pts    = round(base * my_pct, 2)
         else:
@@ -491,6 +534,8 @@ def calculate_kpi(sf, user_id, year, quarter):
             pts    = round(base, 2)
 
         notes = []
+        if my_ss == 0:
+            notes.append("No SS&P hours logged")
         if "upsell" in otype.lower():
             notes.append(f"Upsell decel ({dt})")
         if not seg:
@@ -523,7 +568,7 @@ def calculate_kpi(sf, user_id, year, quarter):
         FROM MPM4_BASE__Milestone1_Project__c
         WHERE MPM4_BASE__Status__c = 'Completed'
         AND MPM4_BASE__Opportunity__c IN (
-            SELECT Id FROM Opportunity WHERE Sales_Engineer__c = '{user_id}'
+            SELECT Id FROM Opportunity WHERE Sales_Engineer__c = '{user_id}' AND StageName = 'Closed Won'
         )
         AND Date_Completed__c >= {qs} AND Date_Completed__c <= {qe}
     """)["records"]
@@ -540,8 +585,10 @@ def calculate_kpi(sf, user_id, year, quarter):
     dt_map = {}
     if opp_ids:
         id_str = ",".join(f"'{i}'" for i in opp_ids)
-        for o in sf.query_all(f"SELECT Id, Name, Deal_Type__c FROM Opportunity WHERE Id IN ({id_str})")["records"]:
-            dt_map[o["Id"]] = deal_type_for(o.get("Name", ""), o.get("Deal_Type__c"))
+        opps_raw = sf.query_all(f"SELECT Id, Name, Deal_Type__c FROM Opportunity WHERE Id IN ({id_str})")["records"]
+        del_pf_map = get_product_family_map(sf, [o["Id"] for o in opps_raw])
+        for o in opps_raw:
+            dt_map[o["Id"]] = deal_type_for(o.get("Name", ""), o.get("Deal_Type__c"), del_pf_map.get(o["Id"]))
 
     opp_proj_map = defaultdict(list)
     for p in all_projects:
@@ -575,7 +622,10 @@ def calculate_kpi(sf, user_id, year, quarter):
         my_hrs, other_hrs, other_names = get_logged_hours(sf, p["Id"], user_id)
         total_hrs = my_hrs + other_hrs
 
-        if total_hrs == 0:
+        if my_hrs == 0:
+            pts = 0.0
+            my_pct = 0.0
+        elif total_hrs == 0:
             pts = 0.0
             my_pct = 0.0
         elif fixed_pts is not None:
@@ -595,15 +645,17 @@ def calculate_kpi(sf, user_id, year, quarter):
             "name": proj_name,
             "status": p.get("MPM4_BASE__Status__c", ""),
             "scoped_hours": fixed_pts if fixed_pts is not None else hrs_bracket,
-            "scoped_label": scoped_label,
+            "scoped_hours_raw": scoped,  # None if not set in SF; used by JS for No PS recalc
+            "scoped_label": "No hours logged" if my_hrs == 0 else scoped_label,
             "my_hours": my_hrs,
             "other_hours": round(other_hrs, 2),
             "other_names": other_names,
             "my_pct": round(my_pct * 100, 0),
             "my_pct_raw": round(my_pct, 6),
             "pts": pts,
-            "no_hours": total_hrs == 0,
+            "no_hours": my_hrs == 0,
             "assisted": p["Id"] not in seen_proj_ids,
+            "is_retainer": False,
             "has_ps": has_ps,
         }
 
@@ -655,18 +707,21 @@ def calculate_kpi(sf, user_id, year, quarter):
         pts      = round(base_pts * my_pct, 2)
 
         proj_data = {
-            "name":         proj_name,
-            "status":       p.get("MPM4_BASE__Status__c", ""),
-            "scoped_hours": quarterly_hrs,
-            "scoped_label": threshold_note,
-            "my_hours":     my_hrs,
-            "other_hours":  round(other_hrs, 2),
-            "other_names":  other_names,
-            "my_pct":       round(my_pct * 100, 0),
-            "pts":          pts,
-            "no_hours":     False,
-            "assisted":     False,
-            "is_retainer":  True,
+            "name":             proj_name,
+            "status":           p.get("MPM4_BASE__Status__c", ""),
+            "scoped_hours":     quarterly_hrs,
+            "scoped_hours_raw": None,
+            "scoped_label":     threshold_note,
+            "my_hours":         my_hrs,
+            "other_hours":      round(other_hrs, 2),
+            "other_names":      other_names,
+            "my_pct":           round(my_pct * 100, 0),
+            "my_pct_raw":       round(my_pct, 6),
+            "pts":              pts,
+            "no_hours":         False,
+            "assisted":         False,
+            "is_retainer":      True,
+            "has_ps":           False,
         }
 
         group_key = opp_id or proj_id
@@ -698,8 +753,10 @@ def calculate_kpi(sf, user_id, year, quarter):
     act_dt_map = {}
     if act_opp_ids:
         id_str = ",".join(f"'{i}'" for i in act_opp_ids)
-        for o in sf.query_all(f"SELECT Id, Name, Deal_Type__c FROM Opportunity WHERE Id IN ({id_str})")["records"]:
-            act_dt_map[o["Id"]] = deal_type_for(o.get("Name", ""), o.get("Deal_Type__c"))
+        act_opps_raw = sf.query_all(f"SELECT Id, Name, Deal_Type__c FROM Opportunity WHERE Id IN ({id_str})")["records"]
+        act_pf_map = get_product_family_map(sf, [o["Id"] for o in act_opps_raw])
+        for o in act_opps_raw:
+            act_dt_map[o["Id"]] = deal_type_for(o.get("Name", ""), o.get("Deal_Type__c"), act_pf_map.get(o["Id"]))
 
     pipeline = []
     for p in active:
@@ -1185,18 +1242,34 @@ const PS_PTS = {"2":2,"2t":2,"5":5,"7.5":7.5,"10s":10,"10g":10,"15":15,"5d":5,"1
 const PS_ADDITIVE = new Set(["2","2t"]); // Tune-Up and Training add CPaaS base (2pts)
 const CPAAS_BASE_PTS = 2;
 
+function deliveryPtsByHours(hrs) {
+  if (hrs < 15)  return 2;
+  if (hrs < 35)  return 5;
+  if (hrs < 75)  return 10;
+  if (hrs < 100) return 15;
+  if (hrs < 150) return 20;
+  if (hrs < 350) return 50;
+  return 100;
+}
+
 function onPsSelect(sel) {
   const row = sel.closest('tr');
   const ptsCell = row.querySelector('.proj-pts-cell');
   const basePts = parseFloat(sel.dataset.basePts);
   const myPct = parseFloat(sel.dataset.myPct);
+  const scopedRaw = sel.dataset.scopedRaw;
+
   if (!sel.value) {
     ptsCell.textContent = fmt(basePts);
+  } else if (sel.value === 'nops_cpaas' || sel.value === 'nops_saas') {
+    const fallback = sel.value === 'nops_saas' ? 4.0 : 2.0;
+    const hrs = scopedRaw !== '' ? parseFloat(scopedRaw) : fallback;
+    const fullPts = deliveryPtsByHours(hrs);
+    ptsCell.textContent = fmt(Math.round(fullPts * myPct * 100) / 100);
   } else {
     const psPts = PS_PTS[sel.value] || 0;
     const fullPts = PS_ADDITIVE.has(sel.value) ? CPAAS_BASE_PTS + psPts : psPts;
-    const newPts = Math.round(fullPts * myPct * 100) / 100;
-    ptsCell.textContent = fmt(newPts);
+    ptsCell.textContent = fmt(Math.round(fullPts * myPct * 100) / 100);
   }
   updateDelTotal();
 }
@@ -1316,7 +1389,7 @@ function renderDashboard(data, isCurrent) {
         ? `<span style="color:var(--yellow)">${fmt(r.other_ss_hrs)}h (${r.other_ss_names.join(', ')})</span>`
         : `<span style="color:var(--muted)">-</span>`;
       const pctStr = r.other_ss_hrs > 0 ? `${r.my_ss_pct}%` : (r.my_ss_hrs > 0 ? '100%' : '-');
-      return `<tr data-base-pts="${r.pts}">
+      return `<tr data-base-pts="${r.pts}" ${r.my_ss_hrs === 0 ? 'style="opacity:0.55"' : ''}>
         <td style="max-width:220px">${r.name}${assistedTag}</td>
         <td style="color:var(--muted)">${r.account}</td>
         <td>${badge(r.segment)}</td>
@@ -1328,7 +1401,7 @@ function renderDashboard(data, isCurrent) {
         <td style="text-align:right">${pctStr}</td>
         <td style="text-align:right" class="pts-cell ${r.other_ss_hrs > 0 ? 'shared' : ''}">${fmt(r.pts)}</td>
         <td style="text-align:center"><button class="accel-btn" onclick="toggleAccel(this)" title="Apply 1.5x Named Account accelerator">1.5x</button></td>
-        <td style="font-size:0.78rem;color:var(--muted)">${r.notes}</td>
+        <td style="font-size:0.78rem;color:${r.notes.includes('No SS&P')?'var(--red,#ef4444)':'var(--muted)'}">${r.notes}</td>
       </tr>`;
     }).join('');
   }
@@ -1348,9 +1421,11 @@ function renderDashboard(data, isCurrent) {
         const retainerTag = p.is_retainer ? `<span class="multi-proj-tag" style="color:#7c3aed;background:#ede9fe;border-color:#ddd6fe">Retainer</span>` : '';
         const pctStr = p.other_hours > 0 ? `${p.my_pct}%` : '100%';
         const othersStr = p.other_hours > 0 ? `${fmt(p.other_hours)}h (${p.other_names.join(', ')})` : '-';
-        const psDropdown = p.has_ps ? `
-          <select class="ps-select" data-base-pts="${p.pts}" data-my-pct="${p.my_pct_raw}" onchange="onPsSelect(this)" style="font-size:0.75rem;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:white;color:var(--text);max-width:160px">
+        const psDropdown = `
+          <select class="ps-select" data-base-pts="${p.pts}" data-my-pct="${p.my_pct_raw}" data-scoped-raw="${p.scoped_hours_raw ?? ''}" onchange="onPsSelect(this)" style="font-size:0.75rem;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:white;color:var(--text);max-width:175px">
             <option value="">Auto</option>
+            <option value="nops_cpaas">No PS (CPaaS)</option>
+            <option value="nops_saas">No PS (SaaS)</option>
             <option value="2">Tune-Up (CPaaS + 8h · 4pts)</option>
             <option value="2t">Training (CPaaS + 14h · 4pts)</option>
             <option value="5">Guided Launch (16h · 5pts)</option>
@@ -1361,8 +1436,8 @@ function renderDashboard(data, isCurrent) {
             <option value="5d">CX Discovery (20h · 5pts)</option>
             <option value="10d">CX Design (40h · 10pts)</option>
             <option value="15u">CX Uplift (80h · 15pts)</option>
-          </select>` : '';
-        html += `<tr class="proj-row">
+          </select>`;
+        html += `<tr class="proj-row" ${p.no_hours ? 'style="opacity:0.55"' : ''}>
           <td>${p.name}${sharedTag}${assistedTag}${retainerTag}</td>
           <td style="text-align:right">${fmt(p.scoped_hours)}h</td>
           <td style="text-align:right">${fmt(p.my_hours)}h</td>
@@ -1370,7 +1445,7 @@ function renderDashboard(data, isCurrent) {
           <td style="text-align:right">${pctStr}</td>
           <td style="text-align:right" class="pts-cell proj-pts-cell ${p.other_hours>0?'shared':''}">${fmt(p.pts)}</td>
           <td>${psDropdown}</td>
-          <td style="font-size:0.78rem;color:var(--muted)">${p.scoped_label}</td>
+          <td style="font-size:0.78rem;color:${p.no_hours?'var(--red,#ef4444)':'var(--muted)'}">${p.scoped_label}</td>
         </tr>`;
       });
     });
