@@ -483,9 +483,10 @@ def get_projects_by_time_entries(sf, user_id, qs, qe):
         chunk = ",".join(f"'{x}'" for x in linked_opp_ids[i:i+200])
         rows = sf.query_all(f"SELECT Id, CloseDate FROM Opportunity WHERE Id IN ({chunk}) AND StageName = 'Closed Won'")["records"]
         for r in rows:
-            closed_won_any_ids.add(r["Id"])
+            if r.get("CloseDate") and r["CloseDate"] <= qe:
+                closed_won_any_ids.add(r["Id"])   # closed on or before end of quarter
             if r.get("CloseDate") and qs <= r["CloseDate"] <= qe:
-                closed_won_ids.add(r["Id"])
+                closed_won_ids.add(r["Id"])        # closed in this quarter specifically
 
     return [
         p for p in results
@@ -494,7 +495,8 @@ def get_projects_by_time_entries(sf, user_id, qs, qe):
             p.get("MPM4_BASE__Opportunity__c") in closed_won_ids          # opp closed this quarter
             or (p.get("MPM4_BASE__Opportunity__c") in closed_won_any_ids  # opp closed any time, project completed this quarter
                 and qs <= (p.get("Date_Completed__c") or "") <= qe)
-            or not p.get("MPM4_BASE__Opportunity__c")
+            or (not p.get("MPM4_BASE__Opportunity__c")                    # no linked opp (e.g. DC to DC): gate on Date_Completed__c
+                and qs <= (p.get("Date_Completed__c") or "") <= qe)
         )
     ]
 
@@ -588,7 +590,8 @@ def calculate_kpi(sf, user_id, year, quarter):
             AND CloseDate >= {qs} AND CloseDate <= {qe}
         )
     """)["records"]
-    # Projects completed this quarter where opp is already Closed Won (opp may have closed earlier)
+    # Projects completed this quarter where opp closed this quarter or earlier
+    # (if opp closes in a future quarter, delivery belongs to that future quarter)
     my_projects_by_proj_close = sf.query_all(f"""
         SELECT Id, Name, MPM4_BASE__Status__c, MPM4_BASE__Opportunity__c,
                MPM4_BASE__Opportunity__r.Name, Scoped_Hours_PSS__c
@@ -598,6 +601,7 @@ def calculate_kpi(sf, user_id, year, quarter):
         AND MPM4_BASE__Opportunity__c IN (
             SELECT Id FROM Opportunity WHERE Sales_Engineer__c = '{user_id}'
             AND StageName = 'Closed Won'
+            AND CloseDate <= {qe}
         )
     """)["records"]
     # Merge, deduplicate by project ID
