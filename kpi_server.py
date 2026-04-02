@@ -774,7 +774,7 @@ def calculate_kpi(sf, user_id, year, quarter):
     # ── Active pipeline ───────────────────────────────────────────────────────
     active = sf.query_all(f"""
         SELECT Id, Name, MPM4_BASE__Status__c, MPM4_BASE__Opportunity__c,
-               Scoped_Hours_PSS__c
+               MPM4_BASE__Opportunity__r.Name, Scoped_Hours_PSS__c
         FROM MPM4_BASE__Milestone1_Project__c
         WHERE MPM4_BASE__Status__c NOT IN ('Completed', 'Terminated')
         AND MPM4_BASE__Opportunity__c IN (
@@ -809,7 +809,9 @@ def calculate_kpi(sf, user_id, year, quarter):
             pts = 0.0
         if pts > 0:
             pipeline.append({
+                "proj_id": p["Id"],
                 "name": p.get("Name", ""),
+                "opp_name": p.get("MPM4_BASE__Opportunity__r", {}).get("Name", "") or "",
                 "status": p.get("MPM4_BASE__Status__c", ""),
                 "scoped_hours": hrs_bracket,
                 "my_hours": my_hrs,
@@ -840,6 +842,7 @@ def calculate_kpi(sf, user_id, year, quarter):
         base  = acq_pts(seg, otype, board, dt)
         if base > 0:
             pipeline_acq.append({
+                "opp_id":   o["Id"],
                 "name":     o.get("Name", ""),
                 "account":  (o.get("Account") or {}).get("Name", ""),
                 "segment":  seg,
@@ -1203,7 +1206,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="section-card">
       <div class="section-header">
         <h2>Acquisition Points <span style="color:var(--muted);font-weight:400;font-size:0.85rem">Closed Won this quarter</span></h2>
-        <span class="total-badge" id="acq-total-badge">0 pts</span>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button id="add-acq-btn" onclick="showAddAcqUI()" style="padding:4px 10px;font-size:0.8rem;background:#007bff;color:white;border:none;border-radius:4px;cursor:pointer">+ Add</button>
+          <span class="total-badge" id="acq-total-badge">0 pts</span>
+        </div>
       </div>
       <table>
         <thead><tr>
@@ -1219,7 +1225,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="section-card">
       <div class="section-header">
         <h2>Delivery Points <span style="color:var(--muted);font-weight:400;font-size:0.85rem">Completed projects this quarter</span></h2>
-        <span class="total-badge" id="del-total-badge">0 pts</span>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button id="add-del-btn" onclick="showAddDelUI()" style="padding:4px 10px;font-size:0.8rem;background:#007bff;color:white;border:none;border-radius:4px;cursor:pointer">+ Add</button>
+          <span class="total-badge" id="del-total-badge">0 pts</span>
+        </div>
       </div>
       <table>
         <thead><tr>
@@ -1380,6 +1389,136 @@ function updateDelTotal() {
   document.getElementById('confirmed-card').className = `stat-card ${color}`;
 }
 
+function showAddAcqUI() {
+  const sel = window._pipelineAcq;
+  if (!sel || sel.length === 0) {
+    alert('No active opportunities in pipeline');
+    return;
+  }
+  const html = sel.map((r, i) =>
+    `<option value="${i}">Seg ${r.segment} · ${r.deal_type} · ${r.name.substring(0, 40)}</option>`
+  ).join('');
+  const opts = `<option value="">-- Select --</option>${html}`;
+  const div = document.createElement('div');
+  div.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:white;border:1px solid #ddd;border-radius:8px;padding:20px;box-shadow:0 4px 12px rgba(0,0,0,0.15);z-index:1000;min-width:350px';
+  div.innerHTML = `
+    <div style="font-weight:600;margin-bottom:12px">Add from Pipeline (Acquisition)</div>
+    <select id="acq-sel" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;margin-bottom:12px">${opts}</select>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button onclick="this.closest('div').remove()" style="padding:6px 12px;border:1px solid #ddd;background:white;border-radius:4px;cursor:pointer">Cancel</button>
+      <button onclick="addAcqFromPipeline()" style="padding:6px 12px;background:#28a745;color:white;border:none;border-radius:4px;cursor:pointer">Add</button>
+    </div>
+  `;
+  document.body.appendChild(div);
+  document.getElementById('acq-sel').focus();
+}
+
+function addAcqFromPipeline() {
+  const sel = document.getElementById('acq-sel');
+  const idx = parseInt(sel.value);
+  if (isNaN(idx)) return;
+  const r = window._pipelineAcq[idx];
+  if (!r) return;
+  const row = document.createElement('tr');
+  row.dataset.basePts = r.pts;
+  const assistedTag = r.assisted ? `<span class="multi-proj-tag">Assisted</span>` : '';
+  const otherSs = r.other_ss_hrs > 0
+    ? `<span style="color:var(--yellow)">${fmt(r.other_ss_hrs)}h (${r.other_ss_names.join(', ')})</span>`
+    : `<span style="color:var(--muted)">-</span>`;
+  const pctStr = r.other_ss_hrs > 0 ? `${r.my_ss_pct}%` : (r.my_ss_hrs > 0 ? '100%' : '-');
+  row.innerHTML = `
+    <td style="max-width:220px">${r.name}${assistedTag}<span class="multi-proj-tag" style="color:#6c757d;background:#f0f0f0;border-color:#ddd">Added</span></td>
+    <td style="color:var(--muted)">${r.account}</td>
+    <td>${badge(r.segment)}</td>
+    <td><span class="badge badge-info">${r.type || '?'}</span></td>
+    <td style="font-size:0.8rem;color:var(--muted)">${r.board}</td>
+    <td><span class="badge ${r.deal_type==='SaaS'?'badge-Ar':'badge-B'}">${r.deal_type}</span></td>
+    <td style="text-align:right">${r.my_ss_hrs > 0 ? fmt(r.my_ss_hrs)+'h' : '<span style="color:var(--muted)">-</span>'}</td>
+    <td style="text-align:right">${otherSs}</td>
+    <td style="text-align:right">${pctStr}</td>
+    <td style="text-align:right" class="pts-cell ${r.other_ss_hrs > 0 ? 'shared' : ''}">${fmt(r.pts)}</td>
+    <td style="text-align:center"><button class="accel-btn" onclick="toggleAccel(this)" title="Apply 1.5x Named Account accelerator">1.5x</button></td>
+    <td style="font-size:0.78rem;color:var(--muted)">${r.notes}</td>
+  `;
+  document.getElementById('acq-body').appendChild(row);
+  document.querySelector('div[style*="position:fixed"]')?.remove();
+  updateAcqTotal();
+}
+
+function showAddDelUI() {
+  const sel = window._pipelineDel;
+  if (!sel || sel.length === 0) {
+    alert('No active projects in pipeline');
+    return;
+  }
+  const html = sel.map((r, i) =>
+    `<option value="${i}">${r.opp_name} > ${r.name.substring(0, 30)} (${fmt(r.scoped_hours)}h · ${r.pts} pts)</option>`
+  ).join('');
+  const opts = `<option value="">-- Select --</option>${html}`;
+  const div = document.createElement('div');
+  div.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:white;border:1px solid #ddd;border-radius:8px;padding:20px;box-shadow:0 4px 12px rgba(0,0,0,0.15);z-index:1000;min-width:350px';
+  div.innerHTML = `
+    <div style="font-weight:600;margin-bottom:12px">Add from Pipeline (Delivery)</div>
+    <select id="del-sel" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;margin-bottom:12px">${opts}</select>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button onclick="this.closest('div').remove()" style="padding:6px 12px;border:1px solid #ddd;background:white;border-radius:4px;cursor:pointer">Cancel</button>
+      <button onclick="addDelFromPipeline()" style="padding:6px 12px;background:#28a745;color:white;border:none;border-radius:4px;cursor:pointer">Add</button>
+    </div>
+  `;
+  document.body.appendChild(div);
+  document.getElementById('del-sel').focus();
+}
+
+function addDelFromPipeline() {
+  const sel = document.getElementById('del-sel');
+  const idx = parseInt(sel.value);
+  if (isNaN(idx)) return;
+  const p = window._pipelineDel[idx];
+  if (!p) return;
+  const sharedTag = p.other_hours > 0 ? `<span class="shared-tag">Shared</span>` : '';
+  const assistedTag = p.assisted ? `<span class="multi-proj-tag">Assisted</span>` : '';
+  const retainerTag = p.is_retainer ? `<span class="multi-proj-tag" style="color:#7c3aed;background:#ede9fe;border-color:#ddd6fe">Retainer</span>` : '';
+  const pctStr = p.other_hours > 0 ? `${p.my_pct}%` : '100%';
+  const othersStr = p.other_hours > 0 ? `${fmt(p.other_hours)}h (${p.other_names.join(', ')})` : '-';
+  const psDropdown = `
+    <select class="ps-select" data-base-pts="${p.pts}" data-my-pct="${p.my_pct_raw}" data-scoped-raw="${p.scoped_hours_raw ?? ''}" onchange="onPsSelect(this)" style="font-size:0.75rem;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:white;color:var(--text);max-width:175px">
+      <option value="">Auto</option>
+      <option value="zero">Exclude (0 pts)</option>
+      <option value="nops_cpaas">No PS (CPaaS)</option>
+      <option value="nops_saas">No PS (SaaS)</option>
+      <option value="2">Tune-Up (CPaaS + 8h · 4pts)</option>
+      <option value="2t">Training (CPaaS + 14h · 4pts)</option>
+      <option value="5">Guided Launch (16h · 5pts)</option>
+      <option value="7.5">Email Premium Launch (24h · 7.5pts)</option>
+      <option value="10s">Configured Start (35h · 10pts)</option>
+      <option value="10g">Configured Grow (65h · 10pts)</option>
+      <option value="15">Configured Scale (85h · 15pts)</option>
+      <option value="5d">CX Discovery (20h · 5pts)</option>
+      <option value="10d">CX Design (40h · 10pts)</option>
+      <option value="15u">CX Uplift (80h · 15pts)</option>
+    </select>`;
+  const body = document.getElementById('del-body');
+  const oppRow = document.createElement('tr');
+  oppRow.className = 'opp-row';
+  oppRow.innerHTML = `<td colspan="8">${p.opp_name}</td>`;
+  body.appendChild(oppRow);
+  const projRow = document.createElement('tr');
+  projRow.className = 'proj-row';
+  projRow.innerHTML = `
+    <td>${p.name}${sharedTag}${assistedTag}${retainerTag}<span class="multi-proj-tag" style="color:#6c757d;background:#f0f0f0;border-color:#ddd">Added</span></td>
+    <td style="text-align:right">${fmt(p.scoped_hours)}h</td>
+    <td style="text-align:right">${fmt(p.my_hours)}h</td>
+    <td style="text-align:right;color:${p.other_hours>0?'var(--yellow)':'var(--muted)'}">${othersStr}</td>
+    <td style="text-align:right">${pctStr}</td>
+    <td style="text-align:right" class="pts-cell proj-pts-cell ${p.other_hours>0?'shared':''}">${fmt(p.pts)}</td>
+    <td>${psDropdown}</td>
+    <td style="font-size:0.78rem;color:${p.no_hours?'var(--red,#ef4444)':'var(--muted)'}">${p.scoped_label}</td>
+  `;
+  body.appendChild(projRow);
+  document.querySelector('div[style*="position:fixed"]')?.remove();
+  updateDelTotal();
+}
+
 function toggleAccel(btn) {
   const row = btn.closest('tr');
   const basePts = parseFloat(row.dataset.basePts);
@@ -1420,6 +1559,8 @@ function updateAcqTotal() {
 
 function renderDashboard(data, isCurrent) {
   window._kpiSummary = data.summary;
+  window._pipelineAcq = data.pipeline_acq || [];
+  window._pipelineDel = data.pipeline || [];
   const s = data.summary;
   const pct = Math.min((s.confirmed / s.target) * 100, 100);
   const projPct = Math.min((s.projected / s.target) * 100, 100);
