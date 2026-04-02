@@ -1402,7 +1402,10 @@ function showAddAcqUI() {
   const div = document.createElement('div');
   div.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:white;border:1px solid #ddd;border-radius:8px;padding:20px;box-shadow:0 4px 12px rgba(0,0,0,0.15);z-index:1000;min-width:350px';
   div.innerHTML = `
-    <div style="font-weight:600;margin-bottom:12px">Add from Pipeline (Acquisition)</div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <div style="font-weight:600">Add from Pipeline (Acquisition)</div>
+      <button onclick="this.closest('div').remove()" style="background:none;border:none;font-size:20px;color:#999;cursor:pointer;padding:0;width:24px;height:24px;display:flex;align-items:center;justify-content:center">&times;</button>
+    </div>
     <select id="acq-sel" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;margin-bottom:12px">${opts}</select>
     <div style="display:flex;gap:8px;justify-content:flex-end">
       <button onclick="this.closest('div').remove()" style="padding:6px 12px;border:1px solid #ddd;background:white;border-radius:4px;cursor:pointer">Cancel</button>
@@ -1458,7 +1461,10 @@ function showAddDelUI() {
   const div = document.createElement('div');
   div.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:white;border:1px solid #ddd;border-radius:8px;padding:20px;box-shadow:0 4px 12px rgba(0,0,0,0.15);z-index:1000;min-width:350px';
   div.innerHTML = `
-    <div style="font-weight:600;margin-bottom:12px">Add from Pipeline (Delivery)</div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <div style="font-weight:600">Add from Pipeline (Delivery)</div>
+      <button onclick="this.closest('div').remove()" style="background:none;border:none;font-size:20px;color:#999;cursor:pointer;padding:0;width:24px;height:24px;display:flex;align-items:center;justify-content:center">&times;</button>
+    </div>
     <select id="del-sel" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;margin-bottom:12px">${opts}</select>
     <div style="display:flex;gap:8px;justify-content:flex-end">
       <button onclick="this.closest('div').remove()" style="padding:6px 12px;border:1px solid #ddd;background:white;border-radius:4px;cursor:pointer">Cancel</button>
