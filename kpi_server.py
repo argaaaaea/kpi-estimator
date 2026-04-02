@@ -1404,7 +1404,7 @@ function showAddAcqUI() {
   div.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
       <div style="font-weight:600">Add from Pipeline (Acquisition)</div>
-      <button onclick="this.closest('div').remove()" style="background:none;border:none;font-size:20px;color:#999;cursor:pointer;padding:0;width:24px;height:24px;display:flex;align-items:center;justify-content:center">&times;</button>
+      <button onclick="this.closest('div').parentElement.remove()" style="background:none;border:none;font-size:20px;color:#999;cursor:pointer;padding:0;width:24px;height:24px;display:flex;align-items:center;justify-content:center">&times;</button>
     </div>
     <select id="acq-sel" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;margin-bottom:12px">${opts}</select>
     <div style="display:flex;gap:8px;justify-content:flex-end">
@@ -1463,7 +1463,7 @@ function showAddDelUI() {
   div.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
       <div style="font-weight:600">Add from Pipeline (Delivery)</div>
-      <button onclick="this.closest('div').remove()" style="background:none;border:none;font-size:20px;color:#999;cursor:pointer;padding:0;width:24px;height:24px;display:flex;align-items:center;justify-content:center">&times;</button>
+      <button onclick="this.closest('div').parentElement.remove()" style="background:none;border:none;font-size:20px;color:#999;cursor:pointer;padding:0;width:24px;height:24px;display:flex;align-items:center;justify-content:center">&times;</button>
     </div>
     <select id="del-sel" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;margin-bottom:12px">${opts}</select>
     <div style="display:flex;gap:8px;justify-content:flex-end">
